@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: carnival-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+      - key: BOOTSTRAP_INSTALLER_PASSWORD
+        sync: false
+      - key: BOOTSTRAP_VIEWER_PASSWORD
+        sync: false
