@@ -96,7 +96,17 @@ I.useEffect(()=>{if(!h||!sessionStorage.getItem("carnival_token"))return;const c
         }
         const rr=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:ot.username,password:ot.password})});const dd=await rr.json();if(!rr.ok)throw new Error(dd.error||"Invalid credentials");sessionStorage.setItem("carnival_token",dd.token);
         localStorage.setItem("fibernet_user", JSON.stringify(dd.user));
-        localStorage.setItem("carnival_auth_user", JSON.stringify(dd.user));const st=await fetch("/api/state",{headers:{Authorization:`Bearer ${dd.token}`}});const state=await st.json();if(!st.ok)throw new Error(state.error||"State load failed");t(state.users||[]);l(state.zones||[]);i(state.pops||[]);o(state.olts||[]);y(state.ports||[]);g(state.firstSplitters||[]);_(state.secondSplitters||[]);Q(state.clients||[]);s(dd.user);jo("")}catch(err){console.error(err);jo(err.message||"Login failed")}},ra=(c)=>{let k=Number(c.split(":")[1]);return isNaN(k)?8:k},Vn=(c,k)=>{if(k?.zone!==void 0)z(k.zone);if(k?.pop!==void 0)P(k.pop);if(k?.olt!==void 0)D(k.olt);if(k?.port!==void 0)On(k.port);if(k?.first!==void 0)it(k.first);if(k?.second!==void 0)Hn(k.second);if(c==="zones")z(""),P(""),D(""),On(""),it(""),Hn("");if(c==="pops"){if(P(""),D(""),On(""),it(""),Hn(""),k?.zone!==void 0)z(k.zone)}if(c==="olts")D(""),On(""),it(""),Hn("");if(c==="ports")On(""),it(""),Hn("");if(c==="first")it(""),Hn("");if(c==="second")Hn("");A(c),window.scrollTo(0,0)},searchClient=()=>{let q=clientSearch.trim().toLowerCase();if(!q)return;
+        localStorage.setItem("carnival_auth_user", JSON.stringify(dd.user));const st=await fetch("/api/state",{headers:{Authorization:`Bearer ${dd.token}`}});const state=await st.json();if(!st.ok)throw new Error(state.error||"State load failed");t(state.users||[]);
+l(state.zones||[]);
+i(state.pops||[]);
+o(state.olts||[]);
+y(state.ports||[]);
+g(state.firstSplitters||[]);
+_(state.secondSplitters||[]);
+Q(state.clients||[]);
+s(dd.user);
+jo("");
+setTimeout(()=>location.reload(),100);}catch(err){console.error(err);jo(err.message||"Login failed")}},ra=(c)=>{let k=Number(c.split(":")[1]);return isNaN(k)?8:k},Vn=(c,k)=>{if(k?.zone!==void 0)z(k.zone);if(k?.pop!==void 0)P(k.pop);if(k?.olt!==void 0)D(k.olt);if(k?.port!==void 0)On(k.port);if(k?.first!==void 0)it(k.first);if(k?.second!==void 0)Hn(k.second);if(c==="zones")z(""),P(""),D(""),On(""),it(""),Hn("");if(c==="pops"){if(P(""),D(""),On(""),it(""),Hn(""),k?.zone!==void 0)z(k.zone)}if(c==="olts")D(""),On(""),it(""),Hn("");if(c==="ports")On(""),it(""),Hn("");if(c==="first")it(""),Hn("");if(c==="second")Hn("");A(c),window.scrollTo(0,0)},searchClient=()=>{let q=clientSearch.trim().toLowerCase();if(!q)return;
 let matched=C.filter(k=>(k.clientId||"").toLowerCase()===q || (k.clientId||"").toLowerCase().includes(q));
 if(!matched.length){alert("Client ID not found");return}
 if(matched.length===1){
