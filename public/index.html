@@ -8,7 +8,9 @@
 
 (function(){
   const SUPABASE_URL = "https://ssgwwuvkrizwivblahkb.supabase.co";
-  const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNzZ3d3dXZrcml6d2l2YmxhaGtiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4MzM2MDgsImV4cCI6MjEwNTQwOTYwOH0.aDWs9zv1BlGNuyPC81fQDxkAWYSCAEP5Lp-QcPfNLK8";
+  const SUPABASE_KEY = localStorage.getItem("SUPABASE_ANON_KEY") || "PASTE_YOUR_NEW_ANON_KEY_HERE";
+  // SECURITY: Key ta ekhon hardcoded na. Dashboard theke new key copy kore localStorage e set koro:
+  // localStorage.setItem(sb_publishable_LbI7H8Wwv565Ze_Pk62itQ_BrMHnW_H)
   let sb=null;
   try{
     if(window.supabase && window.supabase.createClient){
