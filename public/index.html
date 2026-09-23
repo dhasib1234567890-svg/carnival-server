@@ -1200,7 +1200,10 @@ document.getElementById("close-multi").onclick=()=>overlay.remove();
           {username:'viewer', password: await sha256('viewer123'), role:'viewer'}
         ];
       }
-      let found = users.find(x=> x.username.toLowerCase()===u.toLowerCase() && (x.password===hp || x.password===p || x.password=== (await sha256(x.password)) ));
+      let found = users.find(x =>
+  x.username.toLowerCase() === u.toLowerCase() &&
+  (x.password === hp || x.password === p)
+);
       // Extra check for plain match
       if(!found){
         found = users.find(x=> x.username.toLowerCase()===u.toLowerCase() && (p===x.username+'123' || p===x.username || p==='admin123' && x.username==='admin'));
