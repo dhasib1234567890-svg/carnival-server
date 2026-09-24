@@ -177,6 +177,10 @@ async function writeState(state) {
   Then set it back to false (or remove it) after login works.
 */
 async function bootstrapUsers() {
+  // Bootstrap users are created only when the username does not already exist.
+  // IMPORTANT: Existing users' passwords are NEVER changed during startup,
+  // redeploy, or restart. Password changes must be done through the app's
+  // Change Password flow.
   const defaults = [
     { id: 'u1', username: 'admin', role: 'admin', env: 'BOOTSTRAP_ADMIN_PASSWORD', fallback: 'admin123' },
     { id: 'u2', username: 'manager', role: 'manager', env: 'BOOTSTRAP_MANAGER_PASSWORD', fallback: 'manager123' },
@@ -184,73 +188,81 @@ async function bootstrapUsers() {
     { id: 'u4', username: 'viewer', role: 'viewer', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
   ];
 
-  const resetPasswords = String(process.env.RESET_BOOTSTRAP_PASSWORDS || '').toLowerCase() === 'true';
-
-  await pool.query("UPDATE public.app_users SET role='installer',updated_at=NOW() WHERE role='write'");
-  await pool.query("UPDATE public.app_users SET role='viewer',updated_at=NOW() WHERE role='read'");
+  // Convert legacy roles once; never touch password_hash here.
+  await pool.query(
+    "UPDATE public.app_users SET role='installer',updated_at=NOW() WHERE role='write'"
+  );
+  await pool.query(
+    "UPDATE public.app_users SET role='viewer',updated_at=NOW() WHERE role='read'"
+  );
 
   for (const u of defaults) {
     const existingByUsername = await pool.query(
       'SELECT id FROM public.app_users WHERE lower(username)=lower($1) LIMIT 1',
       [u.username]
     );
-    const existingById = await pool.query(
-      'SELECT id,username FROM public.app_users WHERE id=$1 LIMIT 1',
+
+    // Existing bootstrap user: preserve its password permanently.
+    if (existingByUsername.rowCount) {
+      await pool.query(
+        `UPDATE public.app_users
+         SET role=$1,updated_at=NOW()
+         WHERE id=$2`,
+        [u.role, existingByUsername.rows[0].id]
+      );
+
+      console.log(
+        `Bootstrap user exists; password preserved: ${u.username}`
+      );
+      continue;
+    }
+
+    // Username is missing. Prefer the historical bootstrap ID if it is free.
+    // If that ID belongs to another existing user, use a new UUID instead of
+    // changing/overwriting that user's identity.
+    const idCheck = await pool.query(
+      'SELECT id FROM public.app_users WHERE id=$1 LIMIT 1',
       [u.id]
     );
+
+    const userId = idCheck.rowCount
+      ? crypto.randomUUID()
+      : u.id;
+
     const password = process.env[u.env] || u.fallback;
 
-    if (existingByUsername.rowCount) {
-      if (resetPasswords) {
-        await pool.query(
-          `UPDATE public.app_users
-           SET role=$1,password_hash=$2,updated_at=NOW()
-           WHERE id=$3`,
-          [u.role, scryptHash(password), existingByUsername.rows[0].id]
-        );
-        console.log(`Bootstrap password reset for ${u.username}`);
-      } else {
-        await pool.query(
-          `UPDATE public.app_users
-           SET role=$1,updated_at=NOW()
-           WHERE id=$2`,
-          [u.role, existingByUsername.rows[0].id]
-        );
-      }
-    } else if (existingById.rowCount) {
-      // Legacy bootstrap IDs (for example u2/u3) may already belong
-      // to installer/viewer users. Reuse the existing row instead of
-      // trying to insert the same primary key again.
-      if (resetPasswords) {
-        await pool.query(
-          `UPDATE public.app_users
-           SET username=$1,role=$2,password_hash=$3,updated_at=NOW()
-           WHERE id=$4`,
-          [u.username, u.role, scryptHash(password), u.id]
-        );
-        console.log(`Bootstrap user repaired/reset: ${u.username} (${u.id})`);
-      } else {
-        await pool.query(
-          `UPDATE public.app_users
-           SET username=$1,role=$2,updated_at=NOW()
-           WHERE id=$3`,
-          [u.username, u.role, u.id]
-        );
-        console.log(`Bootstrap user repaired: ${u.username} (${u.id})`);
-      }
-    } else {
-      await pool.query(
-        `INSERT INTO public.app_users (id,username,role,password_hash)
-         VALUES ($1,$2,$3,$4)`,
-        [u.id, u.username, u.role, scryptHash(password)]
-      );
-      console.log(`Bootstrap user created: ${u.username}`);
-    }
+    await pool.query(
+      `INSERT INTO public.app_users
+       (id,username,role,password_hash)
+       VALUES ($1,$2,$3,$4)`,
+      [
+        userId,
+        u.username,
+        u.role,
+        scryptHash(password)
+      ]
+    );
+
+    console.log(
+      `Bootstrap user created: ${u.username} (${userId})`
+    );
   }
 
-  const users = await pool.query('SELECT id,username,role,permissions FROM public.app_users ORDER BY username');
+  const users = await pool.query(
+    'SELECT id,username,role,permissions FROM public.app_users ORDER BY username'
+  );
+
   const state = await readState();
-  state.users = users.rows.map(u => ({ id:u.id, username:u.username, role:u.role, ...(u.permissions ? {permissions:u.permissions} : {}) }));
+
+  state.users = users.rows.map(u => ({
+    id:u.id,
+    username:u.username,
+    role:u.role,
+    ...(u.permissions
+      ? {permissions:u.permissions}
+      : {})
+  }));
+
   await writeState(state);
 }
 
