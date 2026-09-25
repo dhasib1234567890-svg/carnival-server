@@ -1331,22 +1331,20 @@ document.getElementById("close-multi").onclick=()=>overlay.remove();
 })();
 </script>
 <script>
-/* CARNIVAL V41 — SERVER-FIRST MULTI-PC HYDRATION
-   On every hosted page load, if a backend session exists, fetch the canonical
-   state from Render before the React UI is allowed to keep stale local cache.
-   This prevents an old PC's fibernet_v2_data from hiding newer server data.
+/* CARNIVAL V41 - SERVER-FIRST MULTI-PC HYDRATION
+   Uses this uploaded index(1).html as the base. After backend login, the
+   server state is authoritative and replaces stale local cache before reload.
 */
 (function(){
-  if(window.__carnivalV41) return;
-  window.__carnivalV41=true;
-  if(location.protocol!=='http:' && location.protocol!=='https:') return;
-  const tk=sessionStorage.getItem('carnival_token');
-  if(!tk) return;
-  if(sessionStorage.getItem('__carnivalV41Hydrated')==='1') return;
-  sessionStorage.setItem('__carnivalV41Hydrated','1');
-  fetch('/api/state',{headers:{Authorization:'Bearer '+tk}})
-    .then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;})
-    .then(d=>{
+  if(window.__carnivalV41ServerFirst) return;
+  window.__carnivalV41ServerFirst=true;
+  async function hydrateFromServer(){
+    try{
+      const tk=sessionStorage.getItem('carnival_token');
+      if(!tk) return false;
+      const r=await fetch('/api/state',{headers:{Authorization:'Bearer '+tk}});
+      if(!r.ok) return false;
+      const d=await r.json();
       const state={
         users:Array.isArray(d.users)?d.users:[],
         zones:Array.isArray(d.zones)?d.zones:[],
@@ -1357,19 +1355,22 @@ document.getElementById("close-multi").onclick=()=>overlay.remove();
         secondSplitters:Array.isArray(d.secondSplitters)?d.secondSplitters:[],
         clients:Array.isArray(d.clients)?d.clients:[]
       };
-      try{localStorage.setItem('fibernet_v2_data',JSON.stringify(state));}catch(e){}
-      try{localStorage.setItem('carnival_local_state',JSON.stringify(state));}catch(e){}
-      window.__carnivalServerLoaded=true;
+      const current=(()=>{try{return JSON.parse(localStorage.getItem('fibernet_v2_data')||'{}')}catch(e){return {}}})();
+      // Never copy password-like fields from server into local cache.
+      state.users=state.users.map(u=>({id:u.id,username:u.username,role:u.role,...(u.permissions?{permissions:u.permissions}:{})}));
+      state.clients=state.clients.map(c=>{const x={...c}; delete x.password; return x});
+      localStorage.setItem('fibernet_v2_data',JSON.stringify({...current,...state}));
+      localStorage.setItem('carnival_local_state',JSON.stringify({...current,...state}));
       window.__carnivalLastServerState=state;
-      console.log('CARNIVAL V41: server-first state loaded',{
-        zones:state.zones.length,pops:state.pops.length,olts:state.olts.length,clients:state.clients.length
-      });
-      location.reload();
-    })
-    .catch(e=>{
-      sessionStorage.removeItem('__carnivalV41Hydrated');
-      console.warn('CARNIVAL V41: server hydration failed',e.message);
-    });
+      window.__carnivalServerLoaded=true;
+      window.__carnivalStateDirty=false;
+      console.log('CARNIVAL V41: server-first hydration complete',{zones:state.zones.length,pops:state.pops.length,olts:state.olts.length,clients:state.clients.length});
+      return true;
+    }catch(e){console.warn('CARNIVAL V41 hydration failed:',e.message);return false}
+  }
+  window.carnivalV41Hydrate=hydrateFromServer;
+  // If already logged in, hydrate immediately. Login bridge below also triggers reload.
+  if(sessionStorage.getItem('carnival_token')) hydrateFromServer();
 })();
 </script>
 </body></html>
