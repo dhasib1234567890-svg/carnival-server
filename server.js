@@ -29,7 +29,7 @@ const pool = new Pool({
 });
 
 const SESSION_MS = 12 * 60 * 60 * 1000;
-const SESSION_CLEANUP_MS = 30 * 60 * 1000;
+const SESSION_TABLE = 'public.app_sessions';
 const TABLE_KEYS = ['zones', 'pops', 'olts', 'ports', 'firstSplitters', 'secondSplitters', 'clients'];
 
 const emptyState = () => ({
@@ -84,36 +84,19 @@ function verifyPassword(password, stored) {
 
 function newToken() { return crypto.randomBytes(32).toString('hex'); }
 
-function tokenHash(token) {
-  return crypto.createHash('sha256').update(String(token)).digest('hex');
-}
-
 async function auth(req, res, next) {
-  const header = req.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!token) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-
   try {
-    const hash = tokenHash(token);
-    const q = await pool.query(`
-      SELECT s.token_hash, s.expires_at, u.id, u.username, u.role, u.permissions
-      FROM public.app_sessions s
-      JOIN public.app_users u ON u.id = s.user_id
-      WHERE s.token_hash=$1 AND s.expires_at > NOW()
-      LIMIT 1
-    `, [hash]);
-    if (!q.rowCount) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-
-    const row = q.rows[0];
-    const user = { id: row.id, username: row.username, role: row.role, permissions: row.permissions || undefined };
-    await pool.query('UPDATE public.app_sessions SET expires_at=NOW()+($1 * INTERVAL '1 millisecond'), updated_at=NOW() WHERE token_hash=$2', [SESSION_MS, hash]);
-    req.user = user;
-    req.token = token;
-    next();
-  } catch (e) {
-    console.error('Auth lookup failed:', e);
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
+    const header = req.get('authorization') || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    if (!token) return res.status(401).json({ok:false,error:'Unauthorized'});
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const q = await pool.query(`SELECT u.id,u.username,u.role,u.permissions FROM ${SESSION_TABLE} s JOIN public.app_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW() LIMIT 1`, [tokenHash]);
+    if (!q.rowCount) return res.status(401).json({ok:false,error:'Unauthorized'});
+    await pool.query(`UPDATE ${SESSION_TABLE} SET expires_at=NOW()+($1::bigint * INTERVAL '1 millisecond'), last_seen_at=NOW() WHERE token_hash=$2`, [SESSION_MS, tokenHash]);
+    const u=q.rows[0];
+    req.user={id:u.id,username:u.username,role:u.role,permissions:u.permissions||undefined};
+    req.token=token; next();
+  } catch (e) { console.error('Auth failed:',e); return res.status(401).json({ok:false,error:'Unauthorized'}); }
 }
 
 function requireRole(...roles) {
@@ -158,9 +141,9 @@ async function ensureSchema() {
       user_id TEXT NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
       expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_app_sessions_expires_at ON public.app_sessions(expires_at)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS app_sessions_expires_idx ON public.app_sessions(expires_at)`);
     const columns = [
       ['users', "JSONB NOT NULL DEFAULT '[]'::jsonb"], ['zones', "JSONB NOT NULL DEFAULT '[]'::jsonb"],
       ['pops', "JSONB NOT NULL DEFAULT '[]'::jsonb"], ['olts', "JSONB NOT NULL DEFAULT '[]'::jsonb"],
@@ -435,10 +418,8 @@ app.post('/api/login', async (req,res) => {
 
     const token = newToken();
     const user = {id:u.id,username:u.username,role:u.role,permissions:u.permissions || undefined};
-    await pool.query(`
-      INSERT INTO public.app_sessions (token_hash,user_id,expires_at)
-      VALUES ($1,$2,NOW()+($3 * INTERVAL '1 millisecond'))
-    `, [tokenHash(token), u.id, SESSION_MS]);
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await pool.query(`INSERT INTO ${SESSION_TABLE} (token_hash,user_id,expires_at) VALUES ($1,$2,NOW()+($3::bigint * INTERVAL '1 millisecond'))`, [tokenHash,u.id,SESSION_MS]);
     res.json({ok:true,token,user});
   } catch (e) {
     console.error('Login failed:',e);
@@ -492,7 +473,7 @@ app.post('/api/change-password',auth,async (req,res) => {
   } catch (e) { res.status(500).json({ok:false,error:'Password change failed: '+e.message}); }
 });
 
-app.post('/api/logout',auth,async (req,res) => { try { await pool.query('DELETE FROM public.app_sessions WHERE token_hash=$1',[tokenHash(req.token)]); res.json({ok:true}); } catch (e) { res.status(500).json({ok:false,error:'Logout failed'}); } });
+app.post('/api/logout',auth,async (req,res) => { try { const h=crypto.createHash('sha256').update(req.token).digest('hex'); await pool.query(`DELETE FROM ${SESSION_TABLE} WHERE token_hash=$1`,[h]); res.json({ok:true}); } catch(e){ res.status(500).json({ok:false,error:'Logout failed'}); } });
 
 app.use(express.static(PUBLIC_DIR,{extensions:['html']}));
 app.get('*',(req,res) => res.sendFile(path.join(PUBLIC_DIR,'index.html')));
@@ -501,14 +482,10 @@ async function start() {
   await ensureSchema();
   await importLegacyTablesIfStateEmpty();
   await bootstrapUsers();
-  await pool.query('DELETE FROM public.app_sessions WHERE expires_at <= NOW()');
   await pool.query('SELECT 1');
   app.listen(PORT,() => console.log(`Carnival Internet Online running on port ${PORT}`));
 }
 
 start().catch(err => { console.error('Startup failed:',err); process.exit(1); });
 
-setInterval(async () => {
-  try { await pool.query('DELETE FROM public.app_sessions WHERE expires_at <= NOW()'); }
-  catch (e) { console.warn('Session cleanup failed:', e.message); }
-}, SESSION_CLEANUP_MS).unref();
+setInterval(async () => { try { await pool.query(`DELETE FROM ${SESSION_TABLE} WHERE expires_at<=NOW()`); } catch(e) { console.warn('Session cleanup failed:',e.message); } },30*60*1000).unref();
