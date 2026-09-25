@@ -177,92 +177,34 @@ async function writeState(state) {
   Then set it back to false (or remove it) after login works.
 */
 async function bootstrapUsers() {
-  // Bootstrap users are created only when the username does not already exist.
-  // IMPORTANT: Existing users' passwords are NEVER changed during startup,
-  // redeploy, or restart. Password changes must be done through the app's
-  // Change Password flow.
   const defaults = [
     { id: 'u1', username: 'admin', role: 'admin', env: 'BOOTSTRAP_ADMIN_PASSWORD', fallback: 'admin123' },
-    { id: 'u2', username: 'manager', role: 'manager', env: 'BOOTSTRAP_MANAGER_PASSWORD', fallback: 'manager123' },
-    { id: 'u3', username: 'installer', role: 'installer', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
-    { id: 'u4', username: 'viewer', role: 'viewer', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
+    { id: 'u2', username: 'installer', role: 'write', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
+    { id: 'u3', username: 'viewer', role: 'read', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
   ];
 
-  // Convert legacy roles once; never touch password_hash here.
-  await pool.query(
-    "UPDATE public.app_users SET role='installer',updated_at=NOW() WHERE role='write'"
-  );
-  await pool.query(
-    "UPDATE public.app_users SET role='viewer',updated_at=NOW() WHERE role='read'"
-  );
+  const resetPasswords = String(process.env.RESET_BOOTSTRAP_PASSWORDS || '').toLowerCase() === 'true';
 
   for (const u of defaults) {
-    const existingByUsername = await pool.query(
-      'SELECT id FROM public.app_users WHERE lower(username)=lower($1) LIMIT 1',
-      [u.username]
-    );
-
-    // Existing bootstrap user: preserve its password permanently.
-    if (existingByUsername.rowCount) {
-      await pool.query(
-        `UPDATE public.app_users
-         SET role=$1,updated_at=NOW()
-         WHERE id=$2`,
-        [u.role, existingByUsername.rows[0].id]
-      );
-
-      console.log(
-        `Bootstrap user exists; password preserved: ${u.username}`
-      );
-      continue;
-    }
-
-    // Username is missing. Prefer the historical bootstrap ID if it is free.
-    // If that ID belongs to another existing user, use a new UUID instead of
-    // changing/overwriting that user's identity.
-    const idCheck = await pool.query(
-      'SELECT id FROM public.app_users WHERE id=$1 LIMIT 1',
-      [u.id]
-    );
-
-    const userId = idCheck.rowCount
-      ? crypto.randomUUID()
-      : u.id;
-
+    const existing = await pool.query('SELECT id FROM public.app_users WHERE lower(username)=lower($1) LIMIT 1', [u.username]);
     const password = process.env[u.env] || u.fallback;
 
-    await pool.query(
-      `INSERT INTO public.app_users
-       (id,username,role,password_hash)
-       VALUES ($1,$2,$3,$4)`,
-      [
-        userId,
-        u.username,
-        u.role,
-        scryptHash(password)
-      ]
-    );
-
-    console.log(
-      `Bootstrap user created: ${u.username} (${userId})`
-    );
+    if (existing.rowCount) {
+      if (resetPasswords) {
+        await pool.query(`UPDATE public.app_users SET role=$1,password_hash=$2,updated_at=NOW() WHERE id=$3`,
+          [u.role, scryptHash(password), existing.rows[0].id]);
+        console.log(`Bootstrap password reset for ${u.username}`);
+      }
+    } else {
+      await pool.query(`INSERT INTO public.app_users (id,username,role,password_hash) VALUES ($1,$2,$3,$4)`,
+        [u.id, u.username, u.role, scryptHash(password)]);
+      console.log(`Bootstrap user created: ${u.username}`);
+    }
   }
 
-  const users = await pool.query(
-    'SELECT id,username,role,permissions FROM public.app_users ORDER BY username'
-  );
-
+  const users = await pool.query('SELECT id,username,role,permissions FROM public.app_users ORDER BY username');
   const state = await readState();
-
-  state.users = users.rows.map(u => ({
-    id:u.id,
-    username:u.username,
-    role:u.role,
-    ...(u.permissions
-      ? {permissions:u.permissions}
-      : {})
-  }));
-
+  state.users = users.rows.map(u => ({ id:u.id, username:u.username, role:u.role, ...(u.permissions ? {permissions:u.permissions} : {}) }));
   await writeState(state);
 }
 
@@ -294,13 +236,12 @@ async function importLegacyTablesIfStateEmpty() {
   } finally { client.release(); }
 }
 
-async function syncAppUsersFromState(state, actor) {
+async function syncAppUsersFromState(state) {
   const incoming = Array.isArray(state.users) ? state.users : [];
   const existing = await pool.query('SELECT id,username,role,password_hash,permissions FROM public.app_users');
   const byId = new Map(existing.rows.map(x => [String(x.id), x]));
   const byUsername = new Map(existing.rows.map(x => [x.username.toLowerCase(), x]));
-  const seenIds = new Set([String(actor?.id || '')]);
-  const allowedRoles = new Set(['admin','manager','installer','viewer']);
+  const seenIds = new Set();
 
   for (const raw of incoming) {
     const id = String(raw.id || crypto.randomUUID());
@@ -309,14 +250,7 @@ async function syncAppUsersFromState(state, actor) {
     const old = byId.get(id) || byUsername.get(username.toLowerCase());
     const effectiveId = old?.id || id;
     seenIds.add(String(effectiveId));
-
-    let role = String(raw.role || old?.role || 'viewer').toLowerCase();
-    if (role === 'write') role = 'installer';
-    if (role === 'read') role = 'viewer';
-    if (!allowedRoles.has(role)) role = old?.role && allowedRoles.has(old.role) ? old.role : 'viewer';
-    // Never let an admin accidentally demote the account currently being used.
-    if (actor && String(actor.id) === String(effectiveId)) role = 'admin';
-
+    const role = ['admin','write','read'].includes(raw.role) ? raw.role : (old?.role || 'read');
     const permissions = raw.permissions ?? old?.permissions ?? null;
     let passwordHash = old?.password_hash;
     if (raw.password && String(raw.password).trim()) passwordHash = scryptHash(String(raw.password));
@@ -330,52 +264,117 @@ async function syncAppUsersFromState(state, actor) {
         [id,username,role,passwordHash,permissions ? JSON.stringify(permissions) : null]);
     }
   }
-
-  // Admin may delete users, but never the account used for this request.
-  if (seenIds.size) {
-    await pool.query(`DELETE FROM public.app_users WHERE id <> ALL($1::text[])`, [Array.from(seenIds)]);
-  }
+  if (seenIds.size) await pool.query(`DELETE FROM public.app_users WHERE username <> 'admin' AND id <> ALL($1::text[])`, [Array.from(seenIds)]);
 }
 
-function sameJson(a,b) {
-  return JSON.stringify(a) === JSON.stringify(b);
+
+async function syncLegacyTable(table, key, items, client) {
+  if (!(await tableExists(client, table))) return;
+
+  // The legacy tables in this project use an id + data JSONB shape.
+  // If a table has a data column, keep the complete app object there.
+  // This also works with older rows that were created before carnival_state.
+  const cols = await client.query(`
+    SELECT column_name, data_type, udt_name, is_nullable, column_default
+    FROM information_schema.columns
+    WHERE table_schema='public' AND table_name=$1
+    ORDER BY ordinal_position
+  `, [table]);
+  const names = new Set(cols.rows.map(r => r.column_name));
+  if (!names.has('id')) return;
+
+  // Delete rows that no longer exist in the application state so the
+  // normalized tables stay an exact mirror of carnival_state.
+  if (!items.length) {
+    await client.query(`DELETE FROM public.${table}`);
+    return;
+  }
+
+  if (names.has('data')) {
+    for (const item of items) {
+      const id = String(item?.id ?? '');
+      if (!id) continue;
+      await client.query(
+        `INSERT INTO public.${table} (id,data) VALUES ($1,$2::jsonb)
+         ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`,
+        [id, JSON.stringify(item)]
+      );
+    }
+    const ids = items.map(x => String(x?.id ?? '')).filter(Boolean);
+    await client.query(`DELETE FROM public.${table} WHERE id <> ALL($1::text[])`, [ids]);
+    return;
+  }
+
+  // Fallback for normalized tables that expose named columns instead of data.
+  // Only columns that actually exist are written; unknown app fields are ignored.
+  for (const item of items) {
+    const id = String(item?.id ?? '');
+    if (!id) continue;
+    const writable = cols.rows.filter(c =>
+      c.column_name !== 'id' &&
+      c.column_name !== 'created_at' &&
+      c.column_name !== 'updated_at' &&
+      Object.prototype.hasOwnProperty.call(item, c.column_name)
+    );
+    const fields = ['id'];
+    const values = [id];
+    const placeholders = ['$1'];
+    let n = 2;
+    for (const c of writable) {
+      fields.push(c.column_name);
+      let value = item[c.column_name];
+      if (c.udt_name === 'jsonb' || c.udt_name === 'json') value = JSON.stringify(value ?? null);
+      values.push(value);
+      placeholders.push(`$${n++}` + (c.udt_name === 'jsonb' ? '::jsonb' : c.udt_name === 'json' ? '::json' : ''));
+    }
+    const updates = fields.slice(1).map(f => `${f}=EXCLUDED.${f}`);
+    if (updates.length) {
+      await client.query(
+        `INSERT INTO public.${table} (${fields.join(',')}) VALUES (${placeholders.join(',')})
+         ON CONFLICT (id) DO UPDATE SET ${updates.join(',')}`,
+        values
+      );
+    } else {
+      await client.query(`INSERT INTO public.${table} (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [id]);
+    }
+  }
+  const ids = items.map(x => String(x?.id ?? '')).filter(Boolean);
+  await client.query(`DELETE FROM public.${table} WHERE id <> ALL($1::text[])`, [ids]);
 }
 
-function enforceStatePermissions(oldState, incoming, user) {
-  const role = user.role === 'write' ? 'installer' : (user.role === 'read' ? 'viewer' : user.role);
-  const out = normalizeState(incoming);
-  if (role === 'admin') return out;
-
-  // Users are managed only by admin. Always keep the database user list.
-  out.users = oldState.users;
-
-  if (role === 'manager') {
-    if (!sameJson(out.zones, oldState.zones)) {
-      throw Object.assign(new Error('Manager cannot add, edit, or delete Zones'), { statusCode: 403 });
+async function syncNormalizedTables(state) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const mappings = [
+      ['zones','zones'],
+      ['pops','pops'],
+      ['olts','olts'],
+      ['ports','ports'],
+      ['first_splitters','firstSplitters'],
+      ['second_splitters','secondSplitters'],
+      ['clients','clients'],
+    ];
+    for (const [table,key] of mappings) {
+      await syncLegacyTable(table, key, Array.isArray(state[key]) ? state[key] : [], client);
     }
-    return out;
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
-
-  if (role === 'installer') {
-    for (const key of ['zones','pops','olts','ports','firstSplitters','secondSplitters']) {
-      if (!sameJson(out[key], oldState[key])) {
-        throw Object.assign(new Error('Installer can only add, edit, or delete Clients'), { statusCode: 403 });
-      }
-    }
-    return out;
-  }
-
-  // viewer/read cannot write anything.
-  throw Object.assign(new Error('Viewer is read-only'), { statusCode: 403 });
 }
 
 async function syncState(state, user) {
-  const old = await readState();
-  const normalized = enforceStatePermissions(old, state, user);
+  const normalized = normalizeState(state);
+  if (user.role !== 'admin') { const old = await readState(); normalized.users = old.users; }
   await writeState(normalized);
-  if (user.role === 'admin') await syncAppUsersFromState(normalized, user);
+  await syncNormalizedTables(normalized);
+  if (user.role === 'admin') await syncAppUsersFromState(normalized);
   const users = await pool.query('SELECT id,username,role,permissions FROM public.app_users ORDER BY username');
-  normalized.users = users.rows.map(u => ({ id:u.id,username:u.username,role:(u.role==='write'?'installer':u.role==='read'?'viewer':u.role), ...(u.permissions ? {permissions:u.permissions} : {}) }));
+  normalized.users = users.rows.map(u => ({ id:u.id,username:u.username,role:u.role, ...(u.permissions ? {permissions:u.permissions} : {}) }));
   await writeState(normalized);
   return normalized;
 }
@@ -430,15 +429,14 @@ app.get('/api/state',auth,async (req,res) => {
   }
 });
 
-app.put('/api/state',auth,requireRole('admin','manager','installer','viewer','write','read'),async (req,res) => {
+app.put('/api/state',auth,requireRole('admin','write'),async (req,res) => {
   try {
     const state = normalizeState(req.body || {});
     const saved = await syncState(state,req.user);
     res.json({ok:true,state:cleanStateForClient(saved)});
   } catch (e) {
     console.error('State write failed:',e);
-    const code = Number(e?.statusCode || 500);
-    res.status(code).json({ok:false,error: code===403 ? e.message : 'Database write failed: '+e.message});
+    res.status(500).json({ok:false,error:'Database write failed: '+e.message});
   }
 });
 
