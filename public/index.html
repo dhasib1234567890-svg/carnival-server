@@ -41,6 +41,18 @@ I.useEffect(()=>{let c={users:n,zones:r,pops:u,olts:a,ports:p,firstSplitters:m,s
    hydration and is never echoed back to the backend.
 */
 I.useEffect(()=>{
+  /* V45: local changes are saved to the backend; remote hydration never echoes back as a PUT. */
+  if(window.__carnivalApplyingServerState){
+    window.__carnivalApplyingServerState=false;
+    window.__carnivalSkipNextSave=false;
+    window.__carnivalStateDirty=false;
+    return;
+  }
+  if(window.__carnivalSkipNextSave){
+    window.__carnivalSkipNextSave=false;
+    window.__carnivalStateDirty=false;
+    return;
+  }
   if(!h) return;
   const token=sessionStorage.getItem("carnival_token");
   if(!token) return;
@@ -66,39 +78,83 @@ I.useEffect(()=>{
 
   window.__carnivalStateDirty=true;
   clearTimeout(window.__carnivalSaveTimer);
-  window.__carnivalSaveTimer=setTimeout(async()=>{
+  clearTimeout(window.__carnivalRetryTimer);
+
+  const saveSnapshot=async(snapshotJson,snapshotState)=>{
+    const tk=sessionStorage.getItem("carnival_token");
+    if(!tk) return;
     try{
-      const tk=sessionStorage.getItem("carnival_token");
-      if(!tk) return;
       const rr=await fetch("/api/state",{
         method:"PUT",
         headers:{"Content-Type":"application/json","Authorization":"Bearer "+tk},
-        body:currentJson
+        body:snapshotJson,
+        cache:"no-store"
       });
-      const dd=await rr.json();
-      if(!rr.ok){
-        console.error("CARNIVAL V40: backend state save failed",dd);
+      let dd={};
+      try{dd=await rr.json()}catch{}
+      if(rr.status===401){
+        console.error("CARNIVAL V45: session expired/invalid; login required again");
+        sessionStorage.removeItem("carnival_token");
+        window.__carnivalStateDirty=false;
         return;
       }
-      if(dd.state) window.__carnivalLastServerState=dd.state;
-      else window.__carnivalLastServerState=state;
+      if(!rr.ok){
+        console.error("CARNIVAL V45: backend state save failed",dd);
+        window.__carnivalStateDirty=true;
+        window.__carnivalRetryTimer=setTimeout(()=>{
+          try{
+            const live={
+              users:(n||[]).map(v=>({id:v.id,username:v.username,role:v.role,password:""})),
+              zones:r||[],pops:u||[],olts:a||[],ports:p||[],
+              firstSplitters:m||[],secondSplitters:E||[],clients:C||[]
+            };
+            const liveJson=JSON.stringify(live);
+            if(liveJson===snapshotJson || liveJson!==JSON.stringify(window.__carnivalLastServerState||{})){
+              saveSnapshot(liveJson,live);
+            }
+          }catch{}
+        },2500);
+        return;
+      }
+
+      const authoritative=dd.state||snapshotState;
+      window.__carnivalLastServerState=authoritative;
+      window.__carnivalServerLoaded=true;
       try{
-        const authoritative=dd.state||state;
         const cur=JSON.parse(localStorage.getItem("fibernet_v2_data")||"{}");
-        localStorage.setItem("fibernet_v2_data",JSON.stringify({...cur,...authoritative}));
-        localStorage.setItem("carnival_local_state",JSON.stringify({...cur,...authoritative}));
+        const merged={...cur,...authoritative};
+        localStorage.setItem("fibernet_v2_data",JSON.stringify(merged));
+        localStorage.setItem("carnival_local_state",JSON.stringify(merged));
       }catch{}
-      window.__carnivalStateDirty=false;
-      console.log("CARNIVAL V40: backend state saved",{
-        zones:(state.zones||[]).length,pops:(state.pops||[]).length,
-        olts:(state.olts||[]).length,clients:(state.clients||[]).length
+
+      /* If the user edited again while PUT was in flight, keep dirty=true so the newer render saves next. */
+      const liveNow={
+        users:(n||[]).map(v=>({id:v.id,username:v.username,role:v.role,password:""})),
+        zones:r||[],pops:u||[],olts:a||[],ports:p||[],
+        firstSplitters:m||[],secondSplitters:E||[],clients:C||[]
+      };
+      const liveNowJson=JSON.stringify(liveNow);
+      if(liveNowJson===JSON.stringify(authoritative)){
+        window.__carnivalStateDirty=false;
+      }else{
+        window.__carnivalStateDirty=true;
+      }
+      console.log("CARNIVAL V45: backend state saved",{
+        zones:(snapshotState.zones||[]).length,pops:(snapshotState.pops||[]).length,
+        olts:(snapshotState.olts||[]).length,clients:(snapshotState.clients||[]).length
       });
     }catch(err){
-      console.error("CARNIVAL V40: backend sync error",err);
+      console.error("CARNIVAL V45: backend sync error",err);
+      window.__carnivalStateDirty=true;
     }
-  },800);
+  };
 
-  return()=>clearTimeout(window.__carnivalSaveTimer);
+  window.__carnivalSaveNow=saveSnapshot;
+  window.__carnivalSaveTimer=setTimeout(()=>saveSnapshot(currentJson,state),500);
+
+  return()=>{
+    clearTimeout(window.__carnivalSaveTimer);
+  };
 },[h,n,r,u,a,p,m,E,C]);
 
 I.useEffect(()=>{
@@ -1362,81 +1418,58 @@ document.getElementById("close-multi").onclick=()=>overlay.remove();
 </script>
 
 <script>
-/* CARNIVAL V44 - SINGLE AUTHORITATIVE SERVER SYNC
-   Base: user's index-fixed(1)(1).html + V43.
-   - Removes legacy V38 polling.
-   - Keeps one polling loop only.
-   - Server state is authoritative.
-   - Stops polling on 401 until the token changes / a new login occurs.
-   - Preserves existing V40 PUT save + backend normalized-table sync.
-   - Change Password is hidden only while logged out.
+/* CARNIVAL V45 - PERMANENT SERVER-AUTHORITATIVE MULTI-PC SYNC
+   - One /api/state polling loop only (2s).
+   - Server is authoritative.
+   - Add/edit/delete from PC-A -> PUT -> Supabase -> PC-B auto-hydrates.
+   - Remote hydration is explicitly marked so it cannot trigger another PUT.
+   - Local cache is refreshed from the server.
+   - 401 stops polling and clears the dead session instead of spamming requests.
+   - Change Password is hidden only while logged out; it remains after login.
 */
 (function(){
-  if(window.__carnivalV44) return;
-  window.__carnivalV44=true;
+  if(window.__carnivalV45)return;
+  window.__carnivalV45=true;
 
   const stateKeys=["users","zones","pops","olts","ports","firstSplitters","secondSplitters","clients"];
+  let pollingTimer=null;
+  let lastToken="";
+  let stopped401=false;
+  let initialLoadDone=false;
 
-  function cleanServerState(d){
+  function clean(d){
     const out={};
-    stateKeys.forEach(k=>{out[k]=Array.isArray(d&&d[k])?d[k]:[]});
-    out.users=out.users.map(u=>{
-      const x={id:u.id,username:u.username,role:u.role};
-      if(u.permissions)x.permissions=u.permissions;
-      return x;
-    });
+    stateKeys.forEach(k=>out[k]=Array.isArray(d&&d[k])?d[k]:[]);
+    out.users=out.users.map(u=>{const x={id:u.id,username:u.username,role:u.role};if(u.permissions)x.permissions=u.permissions;return x});
     out.clients=out.clients.map(c=>{const x={...c};delete x.password;return x});
     return out;
   }
-
-  function stripPasswords(x){
+  function comparable(x){
     try{
-      const y=JSON.parse(JSON.stringify(x||{}));
-      if(Array.isArray(y.users))y.users=y.users.map(u=>{const z={...u};delete z.password;delete z.plain;return z});
-      if(Array.isArray(y.clients))y.clients=y.clients.map(c=>{const z={...c};delete z.password;return z});
-      return y;
-    }catch(e){return {}}
+      const y=clean(x||{});
+      return JSON.stringify(y);
+    }catch{return ""}
   }
-
-  function same(a,b){return JSON.stringify(stripPasswords(a))===JSON.stringify(stripPasswords(b))}
-
-  function writeCache(state){
+  function writeCache(st){
     try{
       const cur=JSON.parse(localStorage.getItem("fibernet_v2_data")||"{}");
-      const merged={...cur,...state};
+      const merged={...cur,...st};
       localStorage.setItem("fibernet_v2_data",JSON.stringify(merged));
       localStorage.setItem("carnival_local_state",JSON.stringify(merged));
-    }catch(e){}
+    }catch{}
   }
-
-  async function fetchServer(token){
-    const r=await fetch("/api/state",{
-      headers:{Authorization:"Bearer "+token},
-      cache:"no-store"
-    });
-    if(r.status===401){
-      const e=new Error("Unauthorized");
-      e.code=401;
-      throw e;
-    }
-    if(!r.ok){
-      const e=new Error("HTTP "+r.status);
-      e.code=r.status;
-      throw e;
-    }
-    return cleanServerState(await r.json());
-  }
-
-  async function applyServerState(server,force){
-    if(!server)return;
-    if(!force && same(server,window.__carnivalLastServerState))return;
+  function apply(st,force){
+    if(!st)return;
+    const server=clean(st);
+    if(!force && comparable(server)===comparable(window.__carnivalLastServerState))return;
+    window.__carnivalApplyingServerState=true;
+    window.__carnivalSkipNextSave=true;
     window.__carnivalLastServerState=server;
     window.__carnivalServerLoaded=true;
     window.__carnivalStateDirty=false;
     writeCache(server);
-
-    if(window.__reactSetters__){
-      const s=window.__reactSetters__;
+    const s=window.__reactSetters__;
+    if(s){
       if(s.setUsers)s.setUsers(server.users);
       if(s.setZones)s.setZones(server.zones);
       if(s.setPops)s.setPops(server.pops);
@@ -1447,107 +1480,74 @@ document.getElementById("close-multi").onclick=()=>overlay.remove();
       if(s.setClients)s.setClients(server.clients);
     }
   }
+  async function getServer(token){
+    const rr=await fetch("/api/state",{headers:{Authorization:"Bearer "+token},cache:"no-store"});
+    if(rr.status===401){const e=new Error("Unauthorized");e.code=401;throw e}
+    if(!rr.ok){const e=new Error("HTTP "+rr.status);e.code=rr.status;throw e}
+    return clean(await rr.json());
+  }
+  function stop401(token){
+    if(pollingTimer){clearInterval(pollingTimer);pollingTimer=null}
+    stopped401=true;lastToken=token||"";
+    console.warn("CARNIVAL V45: /api/state 401; polling stopped until a new login/session token appears.");
+  }
+  async function pollOnce(){
+    const token=sessionStorage.getItem("carnival_token")||"";
+    if(!token){
+      if(pollingTimer){clearInterval(pollingTimer);pollingTimer=null}
+      stopped401=false;lastToken="";return;
+    }
+    if(stopped401){if(token!==lastToken){stopped401=false;lastToken=token}else return}
+    if(window.__carnivalStateDirty)return;
+    try{
+      const server=await getServer(token);
+      if(!initialLoadDone || comparable(server)!==comparable(window.__carnivalLastServerState))apply(server,!initialLoadDone);
+      initialLoadDone=true;
+    }catch(e){
+      if(e&&e.code===401){stop401(token);return}
+      console.warn("CARNIVAL V45: server poll failed",e);
+    }
+  }
+  function startPolling(){
+    const token=sessionStorage.getItem("carnival_token")||"";
+    if(!token || pollingTimer)return;
+    lastToken=token;stopped401=false;
+    pollOnce();
+    pollingTimer=setInterval(pollOnce,2000);
+  }
 
-  /* Login page only: after login, Change Password remains available. */
-  function removeChangePasswordOnlyWhenLoggedOut(){
+  function hideChangePasswordWhenLoggedOut(){
     try{
       if(sessionStorage.getItem("carnival_token"))return;
       document.querySelectorAll("button").forEach(b=>{
         const tx=(b.textContent||"").replace(/\s+/g," ").trim().toLowerCase();
         if(tx==="change password")b.remove();
       });
-    }catch(e){}
+    }catch{}
   }
+  hideChangePasswordWhenLoggedOut();
+  try{new MutationObserver(hideChangePasswordWhenLoggedOut).observe(document.documentElement,{subtree:true,childList:true})}catch{}
 
-  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",removeChangePasswordOnlyWhenLoggedOut);
-  removeChangePasswordOnlyWhenLoggedOut();
-  try{
-    new MutationObserver(removeChangePasswordOnlyWhenLoggedOut).observe(document.documentElement,{subtree:true,childList:true});
-  }catch(e){}
-
-  let pollingTimer=null;
-  let pollingStopped401=false;
-  let lastToken="";
-
-  function stopPolling401(token){
-    if(pollingTimer){
-      clearInterval(pollingTimer);
-      pollingTimer=null;
-    }
-    pollingStopped401=true;
-    lastToken=token||"";
-    console.warn("CARNIVAL V44: /api/state returned 401; polling stopped until a new login/session token appears.");
-  }
-
-  async function pollOnce(){
-    const token=sessionStorage.getItem("carnival_token");
-    if(!token){
-      if(pollingTimer){clearInterval(pollingTimer);pollingTimer=null}
-      pollingStopped401=false;
-      lastToken="";
-      return;
-    }
-
-    if(pollingStopped401){
-      if(token!==lastToken){
-        pollingStopped401=false;
-        lastToken=token;
-      }else return;
-    }
-
-    if(window.__carnivalStateDirty)return;
-
-    try{
-      const server=await fetchServer(token);
-      await applyServerState(server,false);
-    }catch(e){
-      if(e&&e.code===401){
-        stopPolling401(token);
-        return;
-      }
-      console.warn("CARNIVAL V44: server poll failed",e);
-    }
-  }
-
-  function startPollingIfLoggedIn(){
-    const token=sessionStorage.getItem("carnival_token");
-    if(!token||pollingTimer)return;
-    lastToken=token;
-    pollingStopped401=false;
-    pollOnce();
-    pollingTimer=setInterval(pollOnce,2000);
-  }
-
-  let waitTries=0;
-  const loginWait=setInterval(()=>{
-    waitTries++;
-    removeChangePasswordOnlyWhenLoggedOut();
-    if(sessionStorage.getItem("carnival_token")){
-      clearInterval(loginWait);
-      startPollingIfLoggedIn();
-    }else if(waitTries>120){
-      clearInterval(loginWait);
-    }
+  let tries=0;
+  const wait=setInterval(()=>{
+    tries++;
+    hideChangePasswordWhenLoggedOut();
+    const token=sessionStorage.getItem("carnival_token")||"";
+    if(token){clearInterval(wait);startPolling()}
+    else if(tries>120)clearInterval(wait);
   },250);
 
-  /* Token watcher only; it does NOT call /api/state. */
+  /* Token watcher only; it never calls /api/state itself. */
   setInterval(()=>{
     const token=sessionStorage.getItem("carnival_token")||"";
     if(!token){
       if(pollingTimer){clearInterval(pollingTimer);pollingTimer=null}
-      pollingStopped401=false;
-      lastToken="";
-      removeChangePasswordOnlyWhenLoggedOut();
-      return;
+      stopped401=false;lastToken="";initialLoadDone=false;hideChangePasswordWhenLoggedOut();return;
     }
-    if(token!==lastToken){
-      pollingStopped401=false;
-      lastToken=token;
-      startPollingIfLoggedIn();
-    }
+    if(token!==lastToken){stopped401=false;lastToken=token;initialLoadDone=false;startPolling()}
   },1000);
 
-  console.log("CARNIVAL V44 ACTIVE: single server-authoritative poll + 401 stop + login-only Change Password hide");
+  console.log("CARNIVAL V45 ACTIVE: permanent server-authoritative multi-PC sync + persistent-session client");
 })();
 </script>
 </body></html>
