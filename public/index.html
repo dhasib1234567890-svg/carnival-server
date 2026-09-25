@@ -39,7 +39,7 @@ window.__carnivalDataFlow = 'BACKEND_ONLY';
   }catch(e){}
 })();
 </script>
-<script>console.log("CARNIVAL V45 ACTIVE: server-authoritative multi-PC sync + persistent token");</script>
+<script>console.log("CARNIVAL V45 ACTIVE: server-authoritative multi-PC sync + persistent token + stable remote hydration");</script>
 </head><body><div id="root"></div>
 
 <script>
@@ -69,9 +69,9 @@ I.useEffect(()=>{
   if(!canWrite) return;
   if(!window.__carnivalServerLoaded) return;
 
-  // V45: remote/server hydration is read-only. Never echo a remote state back as a PUT.
-  if(window.__carnivalSkipNextSave){
-    window.__carnivalSkipNextSave=false;
+  // V45 FIX: skip only the React effect caused by an active remote hydration.
+  // Do not use a stale one-shot flag; a remote poll must never suppress a later real edit.
+  if(window.__carnivalApplyingServerState){
     window.__carnivalStateDirty=false;
     clearTimeout(window.__carnivalSaveTimer);
     return;
@@ -121,6 +121,7 @@ I.useEffect(()=>{
         return;
       }
       window.__carnivalLastServerState=dd.state||state;
+      window.__carnivalServerFingerprint=JSON.stringify(window.__carnivalLastServerState);
       window.__carnivalServerLoaded=true;
       window.__carnivalStateDirty=false;
       try{
@@ -199,8 +200,14 @@ I.useEffect(()=>{
   const applyServer=(dd)=>{
     if(cancelled||!dd)return;
     const state=cleanState(dd);
+    const incomingFingerprint=JSON.stringify(state);
+    const previousFingerprint=window.__carnivalServerFingerprint||"";
+    if(incomingFingerprint===previousFingerprint){
+      window.__carnivalServerLoaded=true;
+      return;
+    }
     window.__carnivalApplyingServerState=true;
-    window.__carnivalSkipNextSave=true;
+    window.__carnivalServerFingerprint=incomingFingerprint;
     window.__carnivalLastServerState=state;
     window.__carnivalServerLoaded=true;
     window.__carnivalStateDirty=false;
