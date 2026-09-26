@@ -39,7 +39,7 @@ window.__carnivalDataFlow = 'BACKEND_ONLY';
   }catch(e){}
 })();
 </script>
-<script>console.log("CARNIVAL V45 ACTIVE: server-authoritative multi-PC sync + persistent token + stable remote hydration");</script>
+<script>console.log("CARNIVAL V46 ACTIVE: near-real-time multi-PC sync + persistent token + stable remote hydration");</script>
 </head><body><div id="root"></div>
 
 <script>
@@ -232,10 +232,13 @@ I.useEffect(()=>{
     setTimeout(()=>{window.__carnivalApplyingServerState=false;},0);
   };
 
+  let pollInFlight=false;
   const poll=async()=>{
     const tk=getCarnivalToken();
     if(!tk||cancelled||stopped401)return;
     if(window.__carnivalStateDirty)return;
+    if(pollInFlight)return;
+    pollInFlight=true;
     try{
       const rr=await fetch("/api/state",{headers:{Authorization:"Bearer "+tk},cache:"no-store"});
       if(rr.status===401){
@@ -249,13 +252,16 @@ I.useEffect(()=>{
       const dd=await rr.json();
       applyServer(dd);
     }catch(err){
-      if(!cancelled)console.warn("CARNIVAL V45: server poll failed",err);
+      if(!cancelled)console.warn("CARNIVAL V46: server poll failed",err);
+    }finally{
+      pollInFlight=false;
     }
   };
 
-  // Immediate server-first hydration, then one 2-second authoritative poll.
+  // Immediate server-first hydration, then a fast authoritative fallback poll.
+  // 750ms gives near-real-time sync without overlapping requests on slow networks.
   poll();
-  timer=setInterval(poll,2000);
+  timer=setInterval(poll,750);
   return()=>{cancelled=true;if(timer)clearInterval(timer);};
 },[h,V]);
 let Au=h?.role==="admin",qs=h?.role==="write",Ce=Au,bo=Au||qs,canAddClient=Au||qs,at=r.find((c)=>c.id===S),Qn=u.find((c)=>c.id===T),_e=a.find((c)=>c.id===M),je=p.find((c)=>c.id===le),ue=m.find((c)=>c.id===Yt),Ke=E.find((c)=>c.id===ku),ea=u.filter((c)=>c.zoneId===S),na=a.filter((c)=>c.popId===T),$r=p.filter((c)=>c.oltId===M),ta=m.filter((c)=>c.portId===le),Gt=E.filter((c)=>c.firstSplitterId===Yt),Xr=C.filter((c)=>c.secondSplitterId===ku),Eu=async()=>{try{
