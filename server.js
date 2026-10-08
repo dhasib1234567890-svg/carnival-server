@@ -28,8 +28,8 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
+const sessions = new Map();
 const SESSION_MS = 12 * 60 * 60 * 1000;
-const SESSION_TABLE = 'public.app_sessions';
 const TABLE_KEYS = ['zones', 'pops', 'olts', 'ports', 'firstSplitters', 'secondSplitters', 'clients'];
 
 const emptyState = () => ({
@@ -82,21 +82,25 @@ function verifyPassword(password, stored) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function normalizeRole(role) {
+  const r = String(role || '').trim().toLowerCase();
+  if (r === 'write') return 'installer';
+  if (r === 'read') return 'viewer';
+  return ['admin','manager','installer','viewer'].includes(r) ? r : 'viewer';
+}
+
 function newToken() { return crypto.randomBytes(32).toString('hex'); }
 
-async function auth(req, res, next) {
-  try {
-    const header = req.get('authorization') || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-    if (!token) return res.status(401).json({ok:false,error:'Unauthorized'});
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const q = await pool.query(`SELECT u.id,u.username,u.role,u.permissions FROM ${SESSION_TABLE} s JOIN public.app_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW() LIMIT 1`, [tokenHash]);
-    if (!q.rowCount) return res.status(401).json({ok:false,error:'Unauthorized'});
-    await pool.query(`UPDATE ${SESSION_TABLE} SET expires_at=NOW()+($1::bigint * INTERVAL '1 millisecond'), last_seen_at=NOW() WHERE token_hash=$2`, [SESSION_MS, tokenHash]);
-    const u=q.rows[0];
-    req.user={id:u.id,username:u.username,role:u.role,permissions:u.permissions||undefined};
-    req.token=token; next();
-  } catch (e) { console.error('Auth failed:',e); return res.status(401).json({ok:false,error:'Unauthorized'}); }
+function auth(req, res, next) {
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const session = sessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    if (token) sessions.delete(token);
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  session.expiresAt = Date.now() + SESSION_MS;
+  req.user = session.user; req.token = token; next();
 }
 
 function requireRole(...roles) {
@@ -136,14 +140,6 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
-    await client.query(`CREATE TABLE IF NOT EXISTS public.app_sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES public.app_users(id) ON DELETE CASCADE,
-      expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
-    await client.query(`CREATE INDEX IF NOT EXISTS app_sessions_expires_idx ON public.app_sessions(expires_at)`);
     const columns = [
       ['users', "JSONB NOT NULL DEFAULT '[]'::jsonb"], ['zones', "JSONB NOT NULL DEFAULT '[]'::jsonb"],
       ['pops', "JSONB NOT NULL DEFAULT '[]'::jsonb"], ['olts', "JSONB NOT NULL DEFAULT '[]'::jsonb"],
@@ -152,6 +148,9 @@ async function ensureSchema() {
       ['updated_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()'],
     ];
     for (const [name, type] of columns) await client.query(`ALTER TABLE public.carnival_state ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+    // Normalize legacy role names without touching password hashes or network data.
+    await client.query(`UPDATE public.app_users SET role='installer',updated_at=NOW() WHERE role='write'`);
+    await client.query(`UPDATE public.app_users SET role='viewer',updated_at=NOW() WHERE role='read'`);
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; }
   finally { client.release(); }
@@ -190,8 +189,8 @@ async function writeState(state) {
 async function bootstrapUsers() {
   const defaults = [
     { id: 'u1', username: 'admin', role: 'admin', env: 'BOOTSTRAP_ADMIN_PASSWORD', fallback: 'admin123' },
-    { id: 'u2', username: 'installer', role: 'write', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
-    { id: 'u3', username: 'viewer', role: 'read', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
+    { id: 'u2', username: 'installer', role: 'installer', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
+    { id: 'u3', username: 'viewer', role: 'viewer', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
   ];
 
   const resetPasswords = String(process.env.RESET_BOOTSTRAP_PASSWORDS || '').toLowerCase() === 'true';
@@ -261,7 +260,7 @@ async function syncAppUsersFromState(state) {
     const old = byId.get(id) || byUsername.get(username.toLowerCase());
     const effectiveId = old?.id || id;
     seenIds.add(String(effectiveId));
-    const role = ['admin','write','read'].includes(raw.role) ? raw.role : (old?.role || 'read');
+    const role = normalizeRole(raw.role || old?.role || 'viewer');
     const permissions = raw.permissions ?? old?.permissions ?? null;
     let passwordHash = old?.password_hash;
     if (raw.password && String(raw.password).trim()) passwordHash = scryptHash(String(raw.password));
@@ -417,9 +416,8 @@ app.post('/api/login', async (req,res) => {
     }
 
     const token = newToken();
-    const user = {id:u.id,username:u.username,role:u.role,permissions:u.permissions || undefined};
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    await pool.query(`INSERT INTO ${SESSION_TABLE} (token_hash,user_id,expires_at) VALUES ($1,$2,NOW()+($3::bigint * INTERVAL '1 millisecond'))`, [tokenHash,u.id,SESSION_MS]);
+    const user = {id:u.id,username:u.username,role:normalizeRole(u.role),permissions:u.permissions || undefined};
+    sessions.set(token,{user,expiresAt:Date.now()+SESSION_MS});
     res.json({ok:true,token,user});
   } catch (e) {
     console.error('Login failed:',e);
@@ -441,7 +439,7 @@ app.get('/api/state',auth,async (req,res) => {
   }
 });
 
-app.put('/api/state',auth,requireRole('admin','write'),async (req,res) => {
+app.put('/api/state',auth,requireRole('admin','manager','installer'),async (req,res) => {
   try {
     const state = normalizeState(req.body || {});
     const saved = await syncState(state,req.user);
@@ -461,6 +459,39 @@ app.post('/api/migrate',auth,requireRole('admin'),async (req,res) => {
   }
 });
 
+app.post('/api/users/save',auth,requireRole('admin'),async (req,res) => {
+  try {
+    const id = String(req.body?.id || '').trim() || crypto.randomUUID();
+    const username = String(req.body?.username || '').trim();
+    const role = normalizeRole(req.body?.role);
+    const password = String(req.body?.password || '');
+    if (!username) return res.status(400).json({ok:false,error:'Username is required'});
+    if (password && password.length < 4) return res.status(400).json({ok:false,error:'Password must be at least 4 characters'});
+
+    const byId = await pool.query('SELECT id,username,password_hash,permissions FROM public.app_users WHERE id=$1 LIMIT 1',[id]);
+    const byName = await pool.query('SELECT id,username,password_hash,permissions FROM public.app_users WHERE lower(username)=lower($1) LIMIT 1',[username]);
+    const existing = byId.rowCount ? byId.rows[0] : (byName.rowCount ? byName.rows[0] : null);
+    if (byName.rowCount && (!existing || String(existing.id) !== String(byName.rows[0].id))) {
+      return res.status(409).json({ok:false,error:'This username already exists'});
+    }
+
+    if (existing) {
+      const passwordHash = password ? scryptHash(password) : existing.password_hash;
+      await pool.query(`UPDATE public.app_users SET username=$1,role=$2,password_hash=$3,updated_at=NOW() WHERE id=$4`,
+        [username,role,passwordHash,existing.id]);
+      return res.json({ok:true,user:{id:existing.id,username,role}});
+    }
+
+    if (!password) return res.status(400).json({ok:false,error:'Password is required for a new user'});
+    await pool.query(`INSERT INTO public.app_users (id,username,role,password_hash) VALUES ($1,$2,$3,$4)`,
+      [id,username,role,scryptHash(password)]);
+    res.json({ok:true,user:{id,username,role}});
+  } catch (e) {
+    console.error('User save failed:',e);
+    res.status(500).json({ok:false,error:'User save failed: '+e.message});
+  }
+});
+
 app.post('/api/change-password',auth,async (req,res) => {
   try {
     const oldPassword = String(req.body?.oldPassword || '');
@@ -473,7 +504,7 @@ app.post('/api/change-password',auth,async (req,res) => {
   } catch (e) { res.status(500).json({ok:false,error:'Password change failed: '+e.message}); }
 });
 
-app.post('/api/logout',auth,async (req,res) => { try { const h=crypto.createHash('sha256').update(req.token).digest('hex'); await pool.query(`DELETE FROM ${SESSION_TABLE} WHERE token_hash=$1`,[h]); res.json({ok:true}); } catch(e){ res.status(500).json({ok:false,error:'Logout failed'}); } });
+app.post('/api/logout',auth,(req,res) => { sessions.delete(req.token); res.json({ok:true}); });
 
 app.use(express.static(PUBLIC_DIR,{extensions:['html']}));
 app.get('*',(req,res) => res.sendFile(path.join(PUBLIC_DIR,'index.html')));
@@ -488,4 +519,7 @@ async function start() {
 
 start().catch(err => { console.error('Startup failed:',err); process.exit(1); });
 
-setInterval(async () => { try { await pool.query(`DELETE FROM ${SESSION_TABLE} WHERE expires_at<=NOW()`); } catch(e) { console.warn('Session cleanup failed:',e.message); } },30*60*1000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const [token,s] of sessions) if (s.expiresAt < now) sessions.delete(token);
+},30*60*1000).unref();
