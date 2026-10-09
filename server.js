@@ -7,6 +7,15 @@ import pg from 'pg';
 
 const { Pool } = pg;
 const app = express();
+// CORS: allow the UI to be hosted on a different website URL while sharing this backend/database.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json({ limit: '20mb' }));
 
 const __filename = fileURLToPath(import.meta.url);
@@ -82,6 +91,13 @@ function verifyPassword(password, stored) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function normalizeRole(role) {
+  const r = String(role || '').trim().toLowerCase();
+  if (r === 'write') return 'installer';
+  if (r === 'read') return 'viewer';
+  return ['admin','manager','installer','viewer'].includes(r) ? r : 'viewer';
+}
+
 function newToken() { return crypto.randomBytes(32).toString('hex'); }
 
 function auth(req, res, next) {
@@ -141,6 +157,9 @@ async function ensureSchema() {
       ['updated_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()'],
     ];
     for (const [name, type] of columns) await client.query(`ALTER TABLE public.carnival_state ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+    // Normalize legacy role names without touching password hashes or network data.
+    await client.query(`UPDATE public.app_users SET role='installer',updated_at=NOW() WHERE role='write'`);
+    await client.query(`UPDATE public.app_users SET role='viewer',updated_at=NOW() WHERE role='read'`);
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; }
   finally { client.release(); }
@@ -179,8 +198,8 @@ async function writeState(state) {
 async function bootstrapUsers() {
   const defaults = [
     { id: 'u1', username: 'admin', role: 'admin', env: 'BOOTSTRAP_ADMIN_PASSWORD', fallback: 'admin123' },
-    { id: 'u2', username: 'installer', role: 'write', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
-    { id: 'u3', username: 'viewer', role: 'read', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
+    { id: 'u2', username: 'installer', role: 'installer', env: 'BOOTSTRAP_INSTALLER_PASSWORD', fallback: 'installer123' },
+    { id: 'u3', username: 'viewer', role: 'viewer', env: 'BOOTSTRAP_VIEWER_PASSWORD', fallback: 'viewer123' },
   ];
 
   const resetPasswords = String(process.env.RESET_BOOTSTRAP_PASSWORDS || '').toLowerCase() === 'true';
@@ -250,9 +269,7 @@ async function syncAppUsersFromState(state) {
     const old = byId.get(id) || byUsername.get(username.toLowerCase());
     const effectiveId = old?.id || id;
     seenIds.add(String(effectiveId));
-    const roleMap = { write: 'installer', read: 'viewer' };
-    const requestedRole = String(raw.role || 'viewer').toLowerCase();
-    const role = ['admin','manager','installer','viewer'].includes(requestedRole) ? requestedRole : (roleMap[requestedRole] || roleMap[old?.role] || old?.role || 'viewer');
+    const role = normalizeRole(raw.role || old?.role || 'viewer');
     const permissions = raw.permissions ?? old?.permissions ?? null;
     let passwordHash = old?.password_hash;
     if (raw.password && String(raw.password).trim()) passwordHash = scryptHash(String(raw.password));
@@ -408,7 +425,7 @@ app.post('/api/login', async (req,res) => {
     }
 
     const token = newToken();
-    const user = {id:u.id,username:u.username,role:u.role,permissions:u.permissions || undefined};
+    const user = {id:u.id,username:u.username,role:normalizeRole(u.role),permissions:u.permissions || undefined};
     sessions.set(token,{user,expiresAt:Date.now()+SESSION_MS});
     res.json({ok:true,token,user});
   } catch (e) {
@@ -428,46 +445,6 @@ app.get('/api/state',auth,async (req,res) => {
   } catch (e) {
     console.error('State read failed:',e);
     res.status(500).json({ok:false,error:'Database read failed: '+e.message});
-  }
-});
-
-app.post('/api/users/save',auth,requireRole('admin'),async (req,res) => {
-  try {
-    const id = String(req.body?.id || crypto.randomUUID());
-    const username = String(req.body?.username || '').trim();
-    const password = String(req.body?.password || '');
-    const requestedRole = String(req.body?.role || 'viewer').toLowerCase();
-    const roleMap = { write: 'installer', read: 'viewer' };
-    const role = ['admin','manager','installer','viewer'].includes(requestedRole) ? requestedRole : roleMap[requestedRole];
-    if (!username) return res.status(400).json({ok:false,error:'Username is required'});
-    if (!role) return res.status(400).json({ok:false,error:'Invalid role'});
-    if (password && password.length < 4) return res.status(400).json({ok:false,error:'Password must be at least 4 characters'});
-
-    const byId = await pool.query('SELECT id,username FROM public.app_users WHERE id=$1',[id]);
-    const byUsername = await pool.query('SELECT id,username FROM public.app_users WHERE LOWER(username)=LOWER($1)',[username]);
-    if (byUsername.rowCount && String(byUsername.rows[0].id) !== String(id)) {
-      return res.status(409).json({ok:false,error:'This username already exists'});
-    }
-
-    if (byId.rowCount) {
-      if (String(byId.rows[0].username).toLowerCase() === 'admin' && username.toLowerCase() !== 'admin') {
-        return res.status(400).json({ok:false,error:'Default admin username cannot be changed'});
-      }
-      if (password) {
-        await pool.query('UPDATE public.app_users SET username=$1,role=$2,password_hash=$3,updated_at=NOW() WHERE id=$4',[username,role,scryptHash(password),id]);
-      } else {
-        await pool.query('UPDATE public.app_users SET username=$1,role=$2,updated_at=NOW() WHERE id=$3',[username,role,id]);
-      }
-    } else {
-      if (!password) return res.status(400).json({ok:false,error:'Password is required for a new user'});
-      await pool.query('INSERT INTO public.app_users (id,username,role,password_hash,permissions) VALUES ($1,$2,$3,$4,NULL)',[id,username,role,scryptHash(password)]);
-    }
-
-    const q = await pool.query('SELECT id,username,role,permissions FROM public.app_users WHERE id=$1',[id]);
-    res.json({ok:true,user:q.rows[0]});
-  } catch (e) {
-    console.error('User save failed:',e);
-    res.status(500).json({ok:false,error:'User save failed: '+e.message});
   }
 });
 
@@ -491,6 +468,39 @@ app.post('/api/migrate',auth,requireRole('admin'),async (req,res) => {
   }
 });
 
+app.post('/api/users/save',auth,requireRole('admin'),async (req,res) => {
+  try {
+    const id = String(req.body?.id || '').trim() || crypto.randomUUID();
+    const username = String(req.body?.username || '').trim();
+    const role = normalizeRole(req.body?.role);
+    const password = String(req.body?.password || '');
+    if (!username) return res.status(400).json({ok:false,error:'Username is required'});
+    if (password && password.length < 4) return res.status(400).json({ok:false,error:'Password must be at least 4 characters'});
+
+    const byId = await pool.query('SELECT id,username,password_hash,permissions FROM public.app_users WHERE id=$1 LIMIT 1',[id]);
+    const byName = await pool.query('SELECT id,username,password_hash,permissions FROM public.app_users WHERE lower(username)=lower($1) LIMIT 1',[username]);
+    const existing = byId.rowCount ? byId.rows[0] : (byName.rowCount ? byName.rows[0] : null);
+    if (byName.rowCount && (!existing || String(existing.id) !== String(byName.rows[0].id))) {
+      return res.status(409).json({ok:false,error:'This username already exists'});
+    }
+
+    if (existing) {
+      const passwordHash = password ? scryptHash(password) : existing.password_hash;
+      await pool.query(`UPDATE public.app_users SET username=$1,role=$2,password_hash=$3,updated_at=NOW() WHERE id=$4`,
+        [username,role,passwordHash,existing.id]);
+      return res.json({ok:true,user:{id:existing.id,username,role}});
+    }
+
+    if (!password) return res.status(400).json({ok:false,error:'Password is required for a new user'});
+    await pool.query(`INSERT INTO public.app_users (id,username,role,password_hash) VALUES ($1,$2,$3,$4)`,
+      [id,username,role,scryptHash(password)]);
+    res.json({ok:true,user:{id,username,role}});
+  } catch (e) {
+    console.error('User save failed:',e);
+    res.status(500).json({ok:false,error:'User save failed: '+e.message});
+  }
+});
+
 app.post('/api/change-password',auth,async (req,res) => {
   try {
     const oldPassword = String(req.body?.oldPassword || '');
@@ -510,8 +520,6 @@ app.get('*',(req,res) => res.sendFile(path.join(PUBLIC_DIR,'index.html')));
 
 async function start() {
   await ensureSchema();
-  await pool.query("UPDATE public.app_users SET role='installer' WHERE role='write'");
-  await pool.query("UPDATE public.app_users SET role='viewer' WHERE role='read'");
   await importLegacyTablesIfStateEmpty();
   await bootstrapUsers();
   await pool.query('SELECT 1');
